@@ -1,0 +1,13 @@
+# Python virtual environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+
+# Runtime captures, OCR artifacts, and generated QR codes
+data/
+
+# Local editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
