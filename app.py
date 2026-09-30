@@ -14,15 +14,33 @@ import cv2
 import numpy as np
 import qrcode
 from flask import Flask, abort, jsonify, render_template, request, send_from_directory
+from PIL import Image, ImageOps
+from pillow_heif import register_heif_opener
 
 
 APP_DIR = Path(__file__).resolve().parent
 CAPTURE_DIR = APP_DIR / "data" / "captures"
 CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
 app = Flask(__name__)
+register_heif_opener()
 
 _reader = None
 _reader_lock = threading.Lock()
+
+
+def decode_uploaded_image(data: bytes) -> np.ndarray | None:
+    """Decode ordinary web images and iPhone HEIC photos to OpenCV BGR."""
+    image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is not None:
+        return image
+    try:
+        from io import BytesIO
+
+        with Image.open(BytesIO(data)) as source:
+            rgb = np.asarray(ImageOps.exif_transpose(source).convert("RGB"))
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    except Exception:
+        return None
 
 
 def encode_png(image: np.ndarray) -> str:
@@ -139,30 +157,41 @@ def prepare_model_region(label: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return region, enhanced
 
 
+def prepare_cropped_model(image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Prepare a user-selected model-only crop without searching for a label."""
+    region = image
+    # The text detector performs its own normalization. Keeping the original
+    # color edges avoids turning narrow N/3/S glyphs into H/8 lookalikes.
+    return region, region.copy()
+
+
 def get_reader():
     global _reader
     with _reader_lock:
         if _reader is None:
             import easyocr
 
-            # The fixed label layout has already isolated the single model line,
-            # so the heavier free-form text detector is unnecessary here.
-            _reader = easyocr.Reader(["en"], gpu=False, detector=False)
+            # Cropped camera/album images still benefit from EasyOCR's text-line
+            # detector, especially for tall condensed product-label fonts.
+            _reader = easyocr.Reader(["en"], gpu=False)
     return _reader
 
 
-def run_ocr(enhanced: np.ndarray) -> tuple[list[tuple], str | None]:
+def run_ocr(enhanced: np.ndarray, detect_text_line: bool = False) -> tuple[list[tuple], str | None]:
     # Torch currently does not support every newly released Python version. Keep
     # geometry testing available even when the local OCR runtime is unavailable.
     if os.environ.get("ENABLE_EASYOCR") != "1":
         return [], "本機 OCR 尚未啟用；請用 Python 3.12 安裝套件後設定 ENABLE_EASYOCR=1"
     try:
-        return get_reader().recognize(
-            enhanced,
-            detail=1,
-            paragraph=False,
-            allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-",
-        ), None
+        options = {
+            "detail": 1,
+            "paragraph": False,
+            "allowlist": "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-",
+            "decoder": "beamsearch",
+        }
+        if detect_text_line:
+            return get_reader().readtext(enhanced, **options), None
+        return get_reader().recognize(enhanced, **options), None
     except Exception as exc:
         return [], f"EasyOCR 無法執行：{exc}"
 
@@ -200,10 +229,22 @@ def choose_model(ocr_items: list[tuple]) -> tuple[str, str, float]:
     return raw, normalized, confidence
 
 
-def analyze(image: np.ndarray) -> dict:
-    label, detected_preview, _ = find_white_label(image)
-    model_region, enhanced = prepare_model_region(label)
-    results, ocr_error = run_ocr(enhanced)
+def analyze_model_once(image: np.ndarray, already_cropped: bool = False) -> dict:
+    """Run one OCR pass for the product model only.
+
+    Serial numbers are intentionally excluded from the photo/OCR pipeline. They
+    are supplied later by the operator's physical 1D barcode scanner.
+    """
+    if already_cropped:
+        label = image
+        detected_preview = image.copy()
+        model_region, enhanced = prepare_cropped_model(label)
+    else:
+        label, detected_preview, _ = find_white_label(image)
+        model_region, enhanced = prepare_model_region(label)
+    # This is one OCR call in both paths. User-cropped input first detects its
+    # single text line; legacy full-label input uses the pre-isolated top band.
+    results, ocr_error = run_ocr(enhanced, detect_text_line=already_cropped)
     raw, model, confidence = choose_model(results)
     return {
         "model": model,
@@ -260,27 +301,28 @@ def api_analyze():
     started_at = time.perf_counter()
     uploaded = request.files.get("image")
     brand = str(request.form.get("brand") or "other").strip().lower()
+    model_crop = str(request.form.get("modelCrop") or "") == "1"
     if uploaded is None or not uploaded.filename:
         return jsonify({"error": "請選擇照片"}), 400
-    data = np.frombuffer(uploaded.read(), dtype=np.uint8)
-    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    image = decode_uploaded_image(uploaded.read())
     if image is None:
         return jsonify({"error": "無法讀取這張圖片"}), 400
     try:
         try:
-            result = analyze(image)
+            # Exactly one OCR operation is performed for each photo, and that
+            # operation is used only to obtain the product model.
+            result = analyze_model_once(image, already_cropped=model_crop)
             artifacts = result.pop("_artifacts")
         except ValueError as exc:
             # Brand templates do not all use the original LG-style white label.
-            # Preserve the required field photo and let the operator enter both
-            # values while a brand-specific recognizer is being developed.
+            # Preserve the photo and let the operator enter/correct the model.
+            # The serial number never belongs to this OCR fallback.
             result = {
                 "model": "",
                 "modelOriginal": "",
-                "serialNumber": "",
                 "confidence": 0.0,
                 "needsReview": True,
-                "ocrError": f"{exc}；照片已保存，請依照片輸入並確認",
+                "ocrError": f"{exc}；照片已保存，請依照片輸入或修正型號",
                 "ocrItems": [],
             }
             artifacts = {
@@ -310,7 +352,9 @@ def api_analyze():
         )
         result["captureId"] = capture_id
         result["brand"] = brand
-        result.setdefault("serialNumber", "")
+        # Analyze never returns a serial candidate. That field is populated only
+        # by the physical barcode scanner on the review screen.
+        result["serialNumber"] = ""
         result["imageUrls"] = {
             "original": f"/api/captures/{capture_id}/original.jpg",
             "rectified": f"/api/captures/{capture_id}/rectified.png",
@@ -362,6 +406,7 @@ def create_qr():
         "date": qr_date,
         "payload": payload,
         "modelInputMethod": input_method,
+        "serialInputMethod": "barcode",
         "photoConfirmed": True,
     }
     (folder / "result.json").write_text(

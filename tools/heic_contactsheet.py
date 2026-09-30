@@ -1,10 +1,16 @@
+import shutil
+import subprocess
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
-from pillow_heif import register_heif_opener
 
+try:
+    from pillow_heif import register_heif_opener
 
-register_heif_opener()
+    register_heif_opener()
+    HEIC_VIA_PIL = True
+except ImportError:
+    HEIC_VIA_PIL = False
 
 source = Path("Sample")
 output = source / "_review"
@@ -23,12 +29,26 @@ for page_start in range(0, len(files), columns * rows):
     sheet = Image.new("RGB", (cell_size[0] * columns, cell_size[1] * rows), "white")
     draw = ImageDraw.Draw(sheet)
     for index, path in enumerate(page_files):
-        with Image.open(path) as image:
+        full_path = full_output / f"{path.stem}.jpg"
+        if HEIC_VIA_PIL:
+            source_path = path
+        else:
+            converter = shutil.which("heif-convert")
+            if not converter:
+                raise RuntimeError("需要 pillow-heif 套件或 heif-convert 程式才能讀取 HEIC")
+            if not full_path.exists():
+                subprocess.run(
+                    [converter, str(path), str(full_path)],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                )
+            source_path = full_path
+        with Image.open(source_path) as image:
             image = ImageOps.exif_transpose(image).convert("RGB")
-            full_path = full_output / f"{path.stem}.jpg"
-            review_image = image.copy()
-            review_image.thumbnail((2400, 2400))
-            review_image.save(full_path, quality=90)
+            if HEIC_VIA_PIL:
+                review_image = image.copy()
+                review_image.thumbnail((2400, 2400))
+                review_image.save(full_path, quality=90)
             image.thumbnail(thumb_size)
             x = (index % columns) * cell_size[0] + (cell_size[0] - image.width) // 2
             y = (index // columns) * cell_size[1] + 5
