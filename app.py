@@ -259,6 +259,7 @@ def index():
 def api_analyze():
     started_at = time.perf_counter()
     uploaded = request.files.get("image")
+    brand = str(request.form.get("brand") or "other").strip().lower()
     if uploaded is None or not uploaded.filename:
         return jsonify({"error": "請選擇照片"}), 400
     data = np.frombuffer(uploaded.read(), dtype=np.uint8)
@@ -266,8 +267,28 @@ def api_analyze():
     if image is None:
         return jsonify({"error": "無法讀取這張圖片"}), 400
     try:
-        result = analyze(image)
-        artifacts = result.pop("_artifacts")
+        try:
+            result = analyze(image)
+            artifacts = result.pop("_artifacts")
+        except ValueError as exc:
+            # Brand templates do not all use the original LG-style white label.
+            # Preserve the required field photo and let the operator enter both
+            # values while a brand-specific recognizer is being developed.
+            result = {
+                "model": "",
+                "modelOriginal": "",
+                "serialNumber": "",
+                "confidence": 0.0,
+                "needsReview": True,
+                "ocrError": f"{exc}；照片已保存，請依照片輸入並確認",
+                "ocrItems": [],
+            }
+            artifacts = {
+                "detected": image,
+                "rectified": image,
+                "modelRegion": image,
+                "enhanced": cv2.cvtColor(image, cv2.COLOR_BGR2GRAY),
+            }
         capture_id = str(uuid.uuid4())
         folder = CAPTURE_DIR / date.today().isoformat() / capture_id
         folder.mkdir(parents=True)
@@ -279,6 +300,7 @@ def api_analyze():
         metadata = {
             "captureId": capture_id,
             "capturedDate": date.today().isoformat(),
+            "brand": brand,
             "ocrModel": result["model"],
             "ocrOriginal": result["modelOriginal"],
             "ocrConfidence": result["confidence"],
@@ -287,6 +309,8 @@ def api_analyze():
             json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         result["captureId"] = capture_id
+        result["brand"] = brand
+        result.setdefault("serialNumber", "")
         result["imageUrls"] = {
             "original": f"/api/captures/{capture_id}/original.jpg",
             "rectified": f"/api/captures/{capture_id}/rectified.png",
@@ -327,10 +351,12 @@ def create_qr():
     if input_method not in {"ocr", "barcode", "manual"}:
         input_method = "manual"
     payload = f"{model}|{serial}|{qr_date}"
+    brand = str(data.get("brand") or "other").strip().lower()
     qr_image = qrcode.make(payload)
     qr_image.save(folder / "qr.png")
     record = {
         "captureId": folder.name,
+        "brand": brand,
         "model": model,
         "serialNumber": serial,
         "date": qr_date,

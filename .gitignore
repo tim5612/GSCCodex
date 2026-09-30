@@ -6,6 +6,9 @@ __pycache__/
 # Runtime captures, OCR artifacts, and generated QR codes
 data/
 
+# Local sample photos and generated review images
+Sample/
+
 # Local editor and operating-system files
 .vscode/
 .idea/
