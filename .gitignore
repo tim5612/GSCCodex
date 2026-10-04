@@ -9,6 +9,10 @@ data/
 # Local sample photos and generated review images
 Sample/
 
+# Local Codex presentation build and validation files
+.codex-build/
+.codex-finalizer/
+
 # Local editor and operating-system files
 .vscode/
 .idea/
